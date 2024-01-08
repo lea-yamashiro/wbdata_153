@@ -2,149 +2,138 @@
 wbdata.fetcher: retrieve and cache queries
 """
 
-import datetime
+import contextlib
+import dataclasses
+import datetime as dt
 import json
 import logging
-import pickle
 import pprint
+from typing import Any, Dict, List, MutableMapping, NamedTuple, Tuple, Union
 
-import appdirs
+import backoff
 import requests
 
-import wbdata
+from .types import Row
 
-from pathlib import Path
-
-EXP = 7
 PER_PAGE = 1000
-TODAY = datetime.date.today()
-TRIES = 5
+TRIES = 3
 
 
-class WBResults(list):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.last_updated = None
+def _strip_id(row: Row) -> None:
+    with contextlib.suppress(KeyError):
+        row["id"] = row["id"].strip()  # type: ignore[union-attr]
 
 
-class Cache(object):
-    """Docstring for Cache """
-
-    def __init__(self):
-        self.path = Path(
-            appdirs.user_cache_dir(appname="wbdata", version=wbdata.__version__)
-        )
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            with self.path.open("rb") as cachefile:
-                self.cache = {
-                    i: (date, json)
-                    for i, (date, json) in pickle.load(cachefile).items()
-                    if (TODAY - datetime.date.fromordinal(date)).days < EXP
-                }
-        except (IOError, EOFError):
-            self.cache = {}
-
-    def __getitem__(self, key):
-        return self.cache[key][1]
-
-    def __setitem__(self, key, value):
-        self.cache[key] = TODAY.toordinal(), value
-        self.sync()
-
-    def __contains__(self, item):
-        return item in self.cache
-
-    def sync(self):
-        """Sync cache to disk"""
-        with self.path.open("wb") as cachefile:
-            pickle.dump(self.cache, cachefile)
+Response = Tuple[Dict[str, Any], List[Dict[str, Any]]]
 
 
-CACHE = Cache()
+class ParsedResponse(NamedTuple):
+    rows: List[Row]
+    page: int
+    pages: int
+    last_updated: Union[str, None]
 
 
-def get_json_from_url(url, args):
-    """
-    Fetch a url directly from the World Bank, up to TRIES tries
-
-    :url: the  url to retrieve
-    :args: a dictionary of GET arguments
-    :returns: a string with the url contents
-    """
-    for _ in range(TRIES):
-        try:
-            return requests.get(url, args).text
-        except requests.ConnectionError:
-            continue
-    logging.error(f"Error connecting to {url}")
-    raise RuntimeError("Couldn't connect to API")
-
-
-def get_response(url, args, cache=True):
-    """
-    Get single page response from World Bank API or from cache
-    : query_url: the base url to be queried
-    : args: a dictionary of GET arguments
-    : cache: use the cache
-    : returns: a dictionary with the response from the API
-    """
-    logging.debug(f"fetching {url}")
-    key = (url, tuple(sorted(args.items())))
-    if cache and key in CACHE:
-        response = CACHE[key]
-    else:
-        response = get_json_from_url(url, args)
-        if cache:
-            CACHE[key] = response
-    return json.loads(response)
-
-
-def fetch(url, args=None, cache=True):
-    """Fetch data from the World Bank API or from cache.
-
-    Given the base url, keep fetching results until there are no more pages.
-
-    : query_url: the base url to be queried
-    : args: a dictionary of GET arguments
-    : cache: use the cache
-    : returns: a list of dictionaries containing the response to the query
-    """
-    if args is None:
-        args = {}
-    else:
-        args = dict(args)
-    args["format"] = "json"
-    args["per_page"] = PER_PAGE
-    results = []
-    pages, this_page = 0, 1
-    while pages != this_page:
-        response = get_response(url, args, cache=cache)
-        try:
-            results.extend(response[1])
-            this_page = response[0]["page"]
-            pages = response[0]["pages"]
-        except (IndexError, KeyError):
-            try:
-                message = response[0]["message"][0]
-                raise RuntimeError(
-                    f"Got error {message['id']} ({message['key']}): "
-                    f"{message['value']}"
-                )
-            except (IndexError, KeyError):
-                raise RuntimeError(
-                    f"Got unexpected response:\n{pprint.pformat(response)}"
-                )
-        logging.debug(f"Processed page {this_page} of {pages}")
-        args["page"] = int(this_page) + 1
-    for i in results:
-        if "id" in i:
-            i["id"] = i["id"].strip()
-    results = WBResults(results)
+def _parse_response(response: Response) -> ParsedResponse:
     try:
-        results.last_updated = datetime.datetime.strptime(
-            response[0]["lastupdated"], "%Y-%m-%d"
+        return ParsedResponse(
+            rows=response[1],
+            page=int(response[0]["page"]),
+            pages=int(response[0]["pages"]),
+            last_updated=response[0].get("lastupdated"),
         )
-    except KeyError:
-        pass
-    return results
+    except (IndexError, KeyError) as e:
+        try:
+            message = response[0]["message"][0]
+            raise RuntimeError(
+                f"Got error {message['id']} ({message['key']}): " f"{message['value']}"
+            ) from e
+        except (IndexError, KeyError) as e:
+            raise RuntimeError(
+                f"Got unexpected response:\n{pprint.pformat(response)}"
+            ) from e
+
+
+CacheKey = Tuple[str, Tuple[Tuple[str, Any], ...]]
+
+
+@dataclasses.dataclass
+class Fetcher:
+    cache: MutableMapping[CacheKey, str]
+    session: requests.Session = dataclasses.field(default_factory=requests.Session)
+
+    @backoff.on_exception(
+        wait_gen=backoff.expo,
+        exception=requests.exceptions.ConnectTimeout,
+        max_tries=TRIES,
+    )
+    def _get_response_body(
+        self,
+        url: str,
+        params: Dict[str, Any],
+    ) -> str:
+        """
+        Fetch a url directly from the World Bank
+
+        :url: the url to retrieve
+        :params: a dictionary of GET parameters
+        :returns: a string with the response content
+        """
+        return self.session.get(url=url, params=params).text
+
+    def _get_response(
+        self,
+        url: str,
+        params: Dict[str, Any],
+        skip_cache=False,
+    ) -> ParsedResponse:
+        """
+        Get single page response from World Bank API or from cache
+        : query_url: the base url to be queried
+        : params: a dictionary of GET arguments
+        : skip_cache: bypass the cache
+        : returns: a dictionary with the response from the API
+        """
+        key = (url, tuple(sorted(params.items())))
+        if not skip_cache and key in self.cache:
+            body = self.cache[key]
+        else:
+            body = self._get_response_body(url, params)
+            self.cache[key] = body
+        return _parse_response(tuple(json.loads(body)))
+
+    def fetch(
+        self,
+        url: str,
+        params=None,
+        skip_cache=False,
+    ) -> Tuple[List[Row], Union[dt.datetime, None]]:
+        """Fetch data from the World Bank API or from cache.
+
+        Given the base url, keep fetching results until there are no more pages.
+
+        : query_url: the base url to be queried
+        : params: a dictionary of GET arguments
+        : skip_cache: use the cache
+        : returns: a list of dictionaries containing the response to the query
+        """
+        params = params or {}
+        params["format"] = "json"
+        params["per_page"] = PER_PAGE
+        page, pages = -1, -2
+        rows: List[Row] = []
+        while pages != page:
+            response = self._get_response(
+                url=url,
+                params=params,
+                skip_cache=skip_cache,
+            )
+            rows.extend(response.rows)
+            page, pages = response.page, response.pages
+            logging.debug(f"Processed page {page} of {pages}")
+            params["page"] = page + 1
+        for row in rows:
+            _strip_id(row)
+        if response.last_updated is None:
+            return rows, None
+        return rows, dt.datetime.strptime(response.last_updated, "%Y-%m-%d")
