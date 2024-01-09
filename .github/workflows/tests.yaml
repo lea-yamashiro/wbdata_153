@@ -31,9 +31,9 @@ jobs:
       - name: Install Poetry Action
         uses: snok/install-poetry@v1.3.4
       - name: Install Dependencies
-        run: poetry install
+        run: poetry install --only main,types
       - name: Run mypy
-        run: poetry run pytest
+        run: poetry run mypy wbdata
   test:
     name: Tests
     runs-on: ${{ matrix.os }}
@@ -51,6 +51,6 @@ jobs:
       - name: Install Poetry Action
         uses: snok/install-poetry@v1.3.4
       - name: Install Dependencies
-        run: poetry install
+        run: poetry install --only main,tests
       - name: Run Tests
         run: poetry run pytest
