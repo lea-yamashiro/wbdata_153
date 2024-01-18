@@ -8,6 +8,8 @@ import decorator
 import requests
 import tabulate
 
+from .dates import Dates
+
 try:
     import pandas as pd  # type: ignore[import-untyped]
 except ImportError:
@@ -15,7 +17,6 @@ except ImportError:
 
 
 from . import cache, dates, fetcher
-from .types import DateArg, IdArg, Row
 
 BASE_URL = "https://api.worldbank.org/v2"
 COUNTRIES_URL = f"{BASE_URL}/countries"
@@ -26,8 +27,12 @@ SOURCES_URL = f"{BASE_URL}/sources"
 TOPIC_URL = f"{BASE_URL}/topics"
 INDIC_ERROR = "Cannot specify more than one of indicator, source, and topic"
 
+DateArg = Union[Dates, None]
+Id = Union[int, str]
+IdArg = Union[Id, Sequence[Id], None]
 
-class SearchResult(List[Row]):
+
+class SearchResult(List[fetcher.Row]):
     """
     A list that prints out a user-friendly table when printed or returned on the
     command line
@@ -129,10 +134,10 @@ class Client:
         self,
         indicator: str,
         country: Union[str, Sequence[str]] = "all",
-        data_date: DateArg = None,
+        date: DateArg = None,
         freq: str = "Y",
         source: IdArg = None,
-        convert_date: bool = False,
+        parse_dates: bool = False,
         skip_cache: bool = False,
     ):
         """
@@ -140,50 +145,50 @@ class Client:
 
         :indicator: the desired indicator code
         :country: a country code, sequence of country codes, or "all" (default)
-        :data_date: the desired date as a datetime object or a 2-tuple with start
+        :date: the desired date as a datetime object or a 2-tuple with start
             and end dates
         :freq: the desired periodicity of the data, one of 'Y' (yearly), 'M'
             (monthly), or 'Q' (quarterly). The indicator may or may not support the
             specified frequency.
         :source: the specific source to retrieve data from (defaults on API to 2,
             World Development Indicators)
-        :convert_date: if True, convert date field to a datetime.datetime object.
+        :parse_dates: if True, convert date field to a datetime.datetime object.
         :skip_cache: bypass the cache when downloading
         :returns: list of dictionaries
         """
-        query_url = COUNTRIES_URL
+        url = COUNTRIES_URL
         try:
             c_part = parse_value_or_iterable(country)
         except TypeError as e:
             raise TypeError("'country' must be a string or iterable'") from e
-        query_url = "/".join((query_url, c_part, "indicators", indicator))
+        url = "/".join((url, c_part, "indicators", indicator))
         args: Dict[str, Any] = {}
-        if data_date:
-            args["date"] = dates.datespec_to_arg(data_date, freq)
+        if date:
+            args["date"] = dates.format_dates(date, freq)
         if source:
             args["source"] = source
-        data = self.fetcher.fetch(query_url, args, skip_cache=skip_cache)
-        if convert_date:
-            dates.convert_dates_to_datetime(data)
+        data = self.fetcher.fetch(url, args, skip_cache=skip_cache)
+        if parse_dates:
+            dates.parse_row_dates(data)
         return data
 
     def _id_only_query(
         self,
-        query_url: str,
-        query_id: Any,
+        url: str,
+        id_: Any,
         skip_cache: bool,
     ) -> SearchResult:
         """
         Retrieve information when ids are the only arguments
 
-        :query_url: the base url to use for the query
-        :query_id: an id or sequence of ids
+        :url: the base url to use for the query
+        :id_: an id or sequence of ids
         :skip_cache: bypass cache when downloading
         :returns: SearchResult containing dictionary objects describing results
         """
-        if query_id:
-            query_url = "/".join((query_url, parse_value_or_iterable(query_id)))
-        return SearchResult(self.fetcher.fetch(url=query_url, skip_cache=skip_cache)[0])
+        if id_:
+            url = "/".join((url, parse_value_or_iterable(id_)))
+        return SearchResult(self.fetcher.fetch(url=url, skip_cache=skip_cache)[0])
 
     def get_source(
         self, source_id: IdArg = None, skip_cache: bool = False
@@ -197,7 +202,7 @@ class Client:
             sources
         """
         return self._id_only_query(
-            query_url=SOURCES_URL, query_id=source_id, skip_cache=skip_cache
+            url=SOURCES_URL, id_=source_id, skip_cache=skip_cache
         )
 
     def get_incomelevel(
@@ -264,7 +269,7 @@ class Client:
         if lendingtype:
             args["lendingType"] = parse_value_or_iterable(lendingtype)
         return SearchResult(
-            self.fetcher.fetch(COUNTRIES_URL, args, skip_cache=skip_cache)[0]
+            self.fetcher.fetch(url=COUNTRIES_URL, args=args, skip_cache=skip_cache)[0]
         )
 
     def get_indicator(self, indicator=None, source=None, topic=None, skip_cache=False):
@@ -283,20 +288,16 @@ class Client:
         if indicator:
             if source or topic:
                 raise ValueError(INDIC_ERROR)
-            query_url = "/".join((INDICATOR_URL, parse_value_or_iterable(indicator)))
+            url = "/".join((INDICATOR_URL, parse_value_or_iterable(indicator)))
         elif source:
             if topic:
                 raise ValueError(INDIC_ERROR)
-            query_url = "/".join(
-                (SOURCES_URL, parse_value_or_iterable(source), "indicators")
-            )
+            url = "/".join((SOURCES_URL, parse_value_or_iterable(source), "indicators"))
         elif topic:
-            query_url = "/".join(
-                (TOPIC_URL, parse_value_or_iterable(topic), "indicators")
-            )
+            url = "/".join((TOPIC_URL, parse_value_or_iterable(topic), "indicators"))
         else:
-            query_url = INDICATOR_URL
-        return SearchResult(self.fetcher.fetch(query_url, skip_cache=skip_cache))
+            url = INDICATOR_URL
+        return SearchResult(self.fetcher.fetch(url, skip_cache=skip_cache))
 
     def search_indicators(self, query, source=None, topic=None, skip_cache=False):
         """
@@ -341,10 +342,10 @@ class Client:
         self,
         indicator: str,
         country: Union[str, Sequence[str]] = "all",
-        data_date: DateArg = None,
+        date: DateArg = None,
         freq: str = "Y",
         source: IdArg = None,
-        convert_date: bool = False,
+        parse_dates: bool = False,
         column_name: str = "value",
         keep_levels: bool = False,
         skip_cache: bool = False,
@@ -354,14 +355,14 @@ class Client:
 
         :indicator: the desired indicator code
         :country: a country code, sequence of country codes, or "all" (default)
-        :data_date: the desired date as a datetime object or a 2-tuple with start
+        :date: the desired date as a datetime object or a 2-tuple with start
             and end dates
         :freq: the desired periodicity of the data, one of 'Y' (yearly), 'M'
             (monthly), or 'Q' (quarterly). The indicator may or may not support the
             specified frequency.
         :source: the specific source to retrieve data from (defaults on API to 2,
             World Development Indicators)
-        :convert_date: if True, convert date field to a datetime.datetime object.
+        :parse_dates: if True, convert date field to a datetime.datetime object.
         :column_name: the desired name for the pandas column
         :keep_levels: if True don't reduce the number of index
             levels returned if only getting one date or country
@@ -371,10 +372,10 @@ class Client:
         raw_data = self.get_data(
             indicator=indicator,
             country=country,
-            data_date=data_date,
+            date=date,
             freq=freq,
             source=source,
-            convert_date=convert_date,
+            parse_dates=parse_dates,
             skip_cache=skip_cache,
         )
         df = pd.DataFrame(
@@ -397,10 +398,10 @@ class Client:
         self,
         indicators: Dict[str, str],
         country="all",
-        data_date=None,
+        date=None,
         freq="Y",
         source=None,
-        convert_date=False,
+        parse_dates=False,
         keep_levels=False,
         skip_cache: bool = False,
     ) -> DataFrame:
@@ -412,14 +413,14 @@ class Client:
         :indicators: An dictionary where the keys are desired indicators and the
             values are the desired column names
         :country: a country code, sequence of country codes, or "all" (default)
-        :data_date: the desired date as a datetime object or a 2-sequence with
+        :date: the desired date as a datetime object or a 2-sequence with
             start and end dates
         :freq: the desired periodicity of the data, one of 'Y' (yearly), 'M'
             (monthly), or 'Q' (quarterly). The indicator may or may not support the
             specified frequency.
         :source: the specific source to retrieve data from (defaults on API to 2,
             World Development Indicators)
-        :convert_date: if True, convert date field to a datetime.datetime object.
+        :parse_dates: if True, convert date field to a datetime.datetime object.
         :keep_levels: if True don't reduce the number of index levels returned if
             only getting one date or country
         :skip_cache: bypass the cache when downloading
@@ -430,10 +431,10 @@ class Client:
                 self.get_series(
                     indicator=indicator,
                     country=country,
-                    data_date=data_date,
+                    date=date,
                     freq=freq,
                     source=source,
-                    convert_date=convert_date,
+                    parse_dates=parse_dates,
                     keep_levels=keep_levels,
                     skip_cache=skip_cache,
                 ).rename(name)

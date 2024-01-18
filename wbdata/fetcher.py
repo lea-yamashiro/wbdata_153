@@ -13,10 +13,11 @@ from typing import Any, Dict, List, MutableMapping, NamedTuple, Tuple, Union
 import backoff
 import requests
 
-from .types import Row
-
 PER_PAGE = 1000
 TRIES = 3
+
+Value = Union[str, int, float, dt.datetime, None]
+Row = Dict[str, Value]
 
 
 def _strip_id(row: Row) -> None:
@@ -33,25 +34,26 @@ class ParsedResponse(NamedTuple):
     pages: int
     last_updated: Union[str, None]
 
-
-def _parse_response(response: Response) -> ParsedResponse:
-    try:
-        return ParsedResponse(
-            rows=response[1],
-            page=int(response[0]["page"]),
-            pages=int(response[0]["pages"]),
-            last_updated=response[0].get("lastupdated"),
-        )
-    except (IndexError, KeyError) as e:
+    @classmethod
+    def from_response(cls, response: Response) -> "ParsedResponse":
         try:
-            message = response[0]["message"][0]
-            raise RuntimeError(
-                f"Got error {message['id']} ({message['key']}): " f"{message['value']}"
-            ) from e
+            return ParsedResponse(
+                rows=response[1],
+                page=int(response[0]["page"]),
+                pages=int(response[0]["pages"]),
+                last_updated=response[0].get("lastupdated"),
+            )
         except (IndexError, KeyError) as e:
-            raise RuntimeError(
-                f"Got unexpected response:\n{pprint.pformat(response)}"
-            ) from e
+            try:
+                message = response[0]["message"][0]
+                raise RuntimeError(
+                    f"Got error {message['id']} ({message['key']}): "
+                    f"{message['value']}"
+                ) from e
+            except (IndexError, KeyError) as e:
+                raise RuntimeError(
+                    f"Got unexpected response:\n{pprint.pformat(response)}"
+                ) from e
 
 
 CacheKey = Tuple[str, Tuple[Tuple[str, Any], ...]]
@@ -79,7 +81,9 @@ class Fetcher:
         :params: a dictionary of GET parameters
         :returns: a string with the response content
         """
-        return self.session.get(url=url, params=params).text
+        # Copy is for mocking. It's kind of depressing but not too expensive
+        body = self.session.get(url=url, params={**params}).text
+        return body
 
     def _get_response(
         self,
@@ -100,7 +104,7 @@ class Fetcher:
         else:
             body = self._get_response_body(url, params)
             self.cache[key] = body
-        return _parse_response(tuple(json.loads(body)))
+        return ParsedResponse.from_response(tuple(json.loads(body)))
 
     def fetch(
         self,
@@ -117,7 +121,7 @@ class Fetcher:
         : skip_cache: use the cache
         : returns: a list of dictionaries containing the response to the query
         """
-        params = params or {}
+        params = {**(params or {})}
         params["format"] = "json"
         params["per_page"] = PER_PAGE
         page, pages = -1, -2
